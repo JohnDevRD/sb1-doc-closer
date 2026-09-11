@@ -1,0 +1,4 @@
+{
+  "service_layer_url": "https://TU_SERVER:50000/b1s/v2",
+  "company_db": "TU_COMPANYDB"
+}
