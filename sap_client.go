@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/cookiejar"
+	"net/url"
 	"strings"
 )
 
@@ -28,6 +29,19 @@ type DocumentMapping struct {
 		DocEntry int `json:"DocEntry"`
 		DocNum   int `json:"DocNum"`
 	} `json:"value"`
+}
+
+// TransferRequest representa un documento de solicitud de traslado con los campos que pide la consulta.
+type TransferRequest struct {
+	DocEntry       int    `json:"DocEntry"`
+	DocDate        string `json:"DocDate"`
+	DocNum         int    `json:"DocNum"`
+	DocumentStatus string `json:"DocumentStatus"`
+}
+
+// TransferRequestList es la respuesta de la lista de documentos abiertos.
+type TransferRequestList struct {
+	Value []TransferRequest `json:"value"`
 }
 
 func NewSAPClient(baseURL, companyDB string) (*SAPClient, error) {
@@ -78,10 +92,20 @@ func (s *SAPClient) Login(user, password string) error {
 // MapDocNumsToDocEntries obtiene los DocEntry correspondientes a los DocNum abiertos
 func (s *SAPClient) MapDocNumsToDocEntries(endpoint string, docNums []string) ([]int, error) {
 	filterNums := strings.Join(docNums, ",")
-	queryURL := fmt.Sprintf("%s/%s?$select=DocEntry,DocNum&$filter=DocNum in (%s) and DocumentStatus eq 'bost_Open'",
-		s.BaseURL, endpoint, filterNums)
+	params := url.Values{}
+	params.Set("$select", "DocEntry,DocNum")
+	params.Set("$filter", fmt.Sprintf("DocNum in (%s) and DocumentStatus eq 'bost_Open'", filterNums))
+	queryURL := fmt.Sprintf("%s/%s?%s", s.BaseURL, endpoint, params.Encode())
 
-	resp, err := s.HTTPClient.Get(queryURL)
+	req, err := http.NewRequest(http.MethodGet, queryURL, nil)
+	if err != nil {
+		return nil, NewSAPConnectionError("consulta", err)
+	}
+	// Service Layer es sensible a estos headers; sin ellos puede devolver 406/415 en algunas versiones.
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := s.HTTPClient.Do(req)
 	if err != nil {
 		return nil, NewSAPConnectionError("consulta", err)
 	}
@@ -89,12 +113,12 @@ func (s *SAPClient) MapDocNumsToDocEntries(endpoint string, docNums []string) ([
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
-		return nil, NewSAPErrorFromResponse("consulta", resp.StatusCode, respBody)
+		return nil, NewSAPErrorFromResponseWithURL("consulta", resp.StatusCode, respBody, queryURL)
 	}
 
 	var mapping DocumentMapping
 	if err := json.NewDecoder(resp.Body).Decode(&mapping); err != nil {
-		return nil, err
+		return nil, NewSAPErrorFromResponseWithURL("consulta", resp.StatusCode, []byte("respuesta no es JSON válido: "+err.Error()), queryURL)
 	}
 
 	var docEntries []int
@@ -106,6 +130,41 @@ func (s *SAPClient) MapDocNumsToDocEntries(endpoint string, docNums []string) ([
 }
 
 // CloseDocumentsBatch envía el $batch para cerrar los documentos resueltos
+func (s *SAPClient) GetOpenTransferRequests() ([]TransferRequest, error) {
+	params := url.Values{}
+	params.Set("$select", "DocEntry,DocDate,DocNum,DocumentStatus")
+	params.Set("$filter", "DocumentStatus eq 'bost_Open'")
+	params.Set("$orderby", "DocNum desc")
+	params.Set("$top", "100")
+	queryURL := fmt.Sprintf("%s/InventoryTransferRequests?%s", s.BaseURL, params.Encode())
+
+	req, err := http.NewRequest(http.MethodGet, queryURL, nil)
+	if err != nil {
+		return nil, NewSAPConnectionError("consulta", err)
+	}
+	// Service Layer puede devolver 406/415 si no se envía Accept explícito.
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := s.HTTPClient.Do(req)
+	if err != nil {
+		return nil, NewSAPConnectionError("consulta", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return nil, NewSAPErrorFromResponseWithURL("consulta", resp.StatusCode, respBody, queryURL)
+	}
+
+	var list TransferRequestList
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		return nil, NewSAPErrorFromResponseWithURL("consulta", resp.StatusCode, []byte("respuesta no es JSON válido: "+err.Error()), queryURL)
+	}
+
+	return list.Value, nil
+}
+
 func (s *SAPClient) CloseDocumentsBatch(endpoint string, docEntries []int) error {
 	boundary := "batch_close_boundary"
 	changeset := "changeset_close_boundary"

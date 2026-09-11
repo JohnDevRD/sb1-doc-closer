@@ -12,3 +12,4 @@ sap-closer.exe
 # OS
 .DS_Store
 Thumbs.db
+.atl/

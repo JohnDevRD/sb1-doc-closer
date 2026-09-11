@@ -3,8 +3,23 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 )
+
+// DebugEnabled indica si se debe mostrar detalle técnico.
+// Actívelo con: $env:SAP_DEBUG="1" (PowerShell) o SAP_DEBUG=1 go run .
+func DebugEnabled() bool {
+	v := strings.TrimSpace(strings.ToLower(os.Getenv("SAP_DEBUG")))
+	return v == "1" || v == "true" || v == "yes"
+}
+
+func truncate(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "...(truncado)"
+}
 
 // SAPError representa un error de Service Layer ya traducido
 // a un mensaje amigable para el usuario final (sin JSON crudo).
@@ -13,6 +28,8 @@ type SAPError struct {
 	StatusCode int    // 0 = error de red / no hubo respuesta HTTP
 	SAPCode    string // code que devuelve SAP en el JSON (ej. "-304")
 	SAPMessage string // message que devuelve SAP en el JSON
+	RawBody    string // cuerpo crudo (solo se muestra con SAP_DEBUG=1)
+	URL        string // URL consultada (solo se muestra con SAP_DEBUG=1)
 	Err        error  // error original de red (si StatusCode == 0)
 }
 
@@ -39,7 +56,12 @@ func toString(v interface{}) string {
 
 // NewSAPErrorFromResponse construye un SAPError a partir del status HTTP y el body.
 func NewSAPErrorFromResponse(op string, statusCode int, body []byte) *SAPError {
-	e := &SAPError{Op: op, StatusCode: statusCode}
+	return NewSAPErrorFromResponseWithURL(op, statusCode, body, "")
+}
+
+// NewSAPErrorFromResponseWithURL igual que NewSAPErrorFromResponse pero guarda la URL para debug.
+func NewSAPErrorFromResponseWithURL(op string, statusCode int, body []byte, url string) *SAPError {
+	e := &SAPError{Op: op, StatusCode: statusCode, URL: url, RawBody: truncate(strings.TrimSpace(string(body)), 2000)}
 	var p sapErrorPayload
 	if len(body) > 0 {
 		_ = json.Unmarshal(body, &p)
@@ -124,11 +146,25 @@ func (e *SAPError) FriendlyMessage() string {
 		if e.StatusCode == 401 || e.StatusCode == 403 {
 			return "La sesión expiró o no tiene permisos. Vuelva a iniciar sesión."
 		}
+		if e.StatusCode == 400 {
+			if strings.Contains(lowerSAP, "invalid") && strings.Contains(lowerSAP, "filter") ||
+				strings.Contains(lowerSAP, "query") || strings.Contains(lowerSAP, "syntax") {
+				return "SAP rechazó la consulta (filtro inválido). Verifique la versión del Service Layer."
+			}
+			return "SAP rechazó la consulta. Verifique la configuración de conexión."
+		}
 		if e.StatusCode == 404 {
-			return "No se pudo consultar los documentos. Verifique la configuración de conexión."
+			return "No se encontró el recurso en SAP. Verifique la URL del Service Layer (debe terminar en /b1s/v2) y la configuración."
+		}
+		if e.StatusCode == 405 || e.StatusCode == 501 {
+			return "Operación no soportada por esta versión de Service Layer."
 		}
 		if e.StatusCode >= 500 {
 			return "El servidor SAP devolvió un error al consultar. Intente de nuevo más tarde."
+		}
+		// 400 u otros con mensaje genérico: si SAP no dio message útil, dar pista de permisos/licencia
+		if e.SAPMessage == "" {
+			return "No se pudieron obtener los documentos. Es posible que el usuario no tenga permiso sobre Solicitudes de traslado o que la sesión haya expirado. Vuelva a iniciar sesión."
 		}
 		return "No se pudieron obtener los documentos. Intente de nuevo."
 	case "cierre":
@@ -158,6 +194,39 @@ func FriendlyErrorMessage(err error, fallback string) string {
 		fallback = "Ocurrió un error inesperado. Intente de nuevo."
 	}
 	return fallback
+}
+
+// DebugDetail devuelve el detalle técnico (status, code, URL, body)
+// SOLO cuando SAP_DEBUG=1. Devuelve "" en modo normal para no exponer JSON.
+func DebugDetail(err error) string {
+	se, ok := err.(*SAPError)
+	if !ok || se == nil {
+		if err != nil && DebugEnabled() {
+			return fmt.Sprintf("[debug] error técnico: %v", err)
+		}
+		return ""
+	}
+	if !DebugEnabled() {
+		return ""
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "[debug] status=%d", se.StatusCode)
+	if se.SAPCode != "" {
+		fmt.Fprintf(&b, " sapCode=%s", se.SAPCode)
+	}
+	if se.SAPMessage != "" {
+		fmt.Fprintf(&b, " sapMessage=%s", truncate(se.SAPMessage, 500))
+	}
+	if se.URL != "" {
+		fmt.Fprintf(&b, "\n[debug] url=%s", se.URL)
+	}
+	if se.RawBody != "" {
+		fmt.Fprintf(&b, "\n[debug] respuesta=%s", se.RawBody)
+	}
+	if se.Err != nil {
+		fmt.Fprintf(&b, "\n[debug] red=%v", se.Err)
+	}
+	return b.String()
 }
 
 // httpStatusUnauthorized evita importar net/http solo por la constante.

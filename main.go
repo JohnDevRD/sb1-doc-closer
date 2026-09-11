@@ -97,7 +97,7 @@ func runApp(cfg Config) {
 
 		switch docOpc {
 		case "1":
-			processCloseDocument(client, "InventoryTransferRequests", "Solicitudes de Traslado")
+			showTransferRequestMenu(client)
 			Pause("")
 		case "9":
 			return
@@ -131,6 +131,11 @@ func processCloseDocument(client *SAPClient, endpoint, docName string) {
 	docEntries, err := client.MapDocNumsToDocEntries(endpoint, rawList)
 	if err != nil {
 		fmt.Printf("Error obteniendo datos: %s\n", FriendlyErrorMessage(err, "No se pudieron obtener los documentos. Intente de nuevo."))
+		if d := DebugDetail(err); d != "" {
+			fmt.Println(d)
+		} else {
+			fmt.Println("(Tip: ejecute con SAP_DEBUG=1 para ver el detalle técnico del error.)")
+		}
 		return
 	}
 
