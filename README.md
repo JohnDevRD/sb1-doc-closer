@@ -10,10 +10,10 @@ CLI en Go para cerrar documentos abiertos de SAP Business One vía **Service Lay
 ## Instalación
 
 ```bash
-go build -o sap-closer
+go build -o sb1-doc-closer
 ```
 
-Esto genera el ejecutable `sap-closer` (o `sap-closer.exe` en Windows).
+Esto genera el ejecutable `sb1-doc-closer` (o `sb1-doc-closer.exe` en Windows).
 
 ## Configuración
 
@@ -29,7 +29,7 @@ Edita `config.json` con los datos de tu entorno:
 ## Uso
 
 ```bash
-./sap-closer
+./sb1-doc-closer
 ```
 
 ### Flujo básico
