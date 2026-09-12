@@ -40,8 +40,12 @@ type TransferRequest struct {
 }
 
 // TransferRequestList es la respuesta de la lista de documentos abiertos.
+// ODataNextLink trae la URL de la siguiente página según el dialécto OData:
+// en /b1s/v1 la clave es "odata.nextLink" (v3) y en /b1s/v2 "@odata.nextLink" (v4).
 type TransferRequestList struct {
-	Value []TransferRequest `json:"value"`
+	Value            []TransferRequest `json:"value"`
+	ODataNextLink    string            `json:"odata.nextLink"`
+	ODataNextLinkV4  string            `json:"@odata.nextLink"`
 }
 
 func NewSAPClient(baseURL, companyDB string) (*SAPClient, error) {
@@ -129,40 +133,83 @@ func (s *SAPClient) MapDocNumsToDocEntries(endpoint string, docNums []string) ([
 	return docEntries, nil
 }
 
-// CloseDocumentsBatch envía el $batch para cerrar los documentos resueltos
+// GetOpenTransferRequests trae TODOS los documentos abiertos siguiendo el
+// nextLink que devuelve Service Layer. SL impone su propio tamaño de página
+// en servidor (típico 20) e ignora $top grandes, por eso el page size se
+// negocia con el header Prefer: odata.maxpagesize y se sigue el nextLink
+// hasta que desaparezca. En /b1s/v2 (OData v4) la clave es @odata.nextLink.
 func (s *SAPClient) GetOpenTransferRequests() ([]TransferRequest, error) {
+	const maxPageSize = 100
 	params := url.Values{}
 	params.Set("$select", "DocEntry,DocDate,DocNum,DocumentStatus")
 	params.Set("$filter", "DocumentStatus eq 'bost_Open'")
 	params.Set("$orderby", "DocNum desc")
-	params.Set("$top", "100")
-	queryURL := fmt.Sprintf("%s/InventoryTransferRequests?%s", s.BaseURL, params.Encode())
+	nextURL := fmt.Sprintf("%s/InventoryTransferRequests?%s", s.BaseURL, params.Encode())
 
-	req, err := http.NewRequest(http.MethodGet, queryURL, nil)
-	if err != nil {
-		return nil, NewSAPConnectionError("consulta", err)
+	var all []TransferRequest
+	seen := map[string]bool{}
+	pages := 0
+
+	for nextURL != "" {
+		if seen[nextURL] {
+			return nil, NewSAPErrorFromResponseWithURL("consulta", 200, []byte("el nextLink se repitió; se cancela para evitar un loop infinito"), nextURL)
+		}
+		seen[nextURL] = true
+
+		pages++
+		if pages > 1000 {
+			return nil, NewSAPErrorFromResponseWithURL("consulta", 200, []byte("se excedió el límite de páginas al consultar (posible loop en nextLink)"), nextURL)
+		}
+
+		req, err := http.NewRequest(http.MethodGet, nextURL, nil)
+		if err != nil {
+			return nil, NewSAPConnectionError("consulta", err)
+		}
+		// Service Layer puede devolver 406/415 si no se envía Accept explícito.
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("Content-Type", "application/json")
+		// Negocia el tamaño de página; SL lo responde en el header Preference-Applied.
+		req.Header.Set("Prefer", fmt.Sprintf("odata.maxpagesize=%d", maxPageSize))
+
+		resp, err := s.HTTPClient.Do(req)
+		if err != nil {
+			return nil, NewSAPConnectionError("consulta", err)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			respBody, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			return nil, NewSAPErrorFromResponseWithURL("consulta", resp.StatusCode, respBody, nextURL)
+		}
+
+		var list TransferRequestList
+		if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+			resp.Body.Close()
+			return nil, NewSAPErrorFromResponseWithURL("consulta", resp.StatusCode, []byte("respuesta no es JSON válido: "+err.Error()), nextURL)
+		}
+		resp.Body.Close()
+
+		all = append(all, list.Value...)
+		next := list.ODataNextLink
+		if next == "" {
+			next = list.ODataNextLinkV4
+		}
+		nextURL = resolveNextLink(s.BaseURL, next)
 	}
-	// Service Layer puede devolver 406/415 si no se envía Accept explícito.
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := s.HTTPClient.Do(req)
-	if err != nil {
-		return nil, NewSAPConnectionError("consulta", err)
+	return all, nil
+}
+
+// resolveNextLink convierte el odata.nextLink (relativo o absoluto) en URL absoluta.
+func resolveNextLink(baseURL, next string) string {
+	next = strings.TrimSpace(strings.Trim(next, `"`))
+	if next == "" {
+		return ""
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return nil, NewSAPErrorFromResponseWithURL("consulta", resp.StatusCode, respBody, queryURL)
+	if strings.HasPrefix(next, "http://") || strings.HasPrefix(next, "https://") {
+		return next
 	}
-
-	var list TransferRequestList
-	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
-		return nil, NewSAPErrorFromResponseWithURL("consulta", resp.StatusCode, []byte("respuesta no es JSON válido: "+err.Error()), queryURL)
-	}
-
-	return list.Value, nil
+	return strings.TrimRight(baseURL, "/") + "/" + strings.TrimLeft(next, "/")
 }
 
 func (s *SAPClient) CloseDocumentsBatch(endpoint string, docEntries []int) error {
