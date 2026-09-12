@@ -13,3 +13,4 @@ sap-closer.exe
 .DS_Store
 Thumbs.db
 .atl/
+config.json
