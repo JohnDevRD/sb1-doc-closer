@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
 	"strings"
+	"time"
 )
 
 type SAPClient struct {
@@ -54,14 +56,23 @@ func NewSAPClient(baseURL, companyDB string) (*SAPClient, error) {
 		return nil, err
 	}
 
-	// Inseguro solo para entornos de pruebas sin certificados SSL válidos
+	// Inseguro solo para entornos de pruebas sin certificados SSL válidos;
+	// configurado con Keep-Alive y Connection Pooling para evitar renegociaciones DNS innecesarias.
 	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 20,
+		IdleConnTimeout:     90 * time.Second,
+		DialContext: (&net.Dialer{
+			Timeout:   15 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
 	}
 
 	client := &http.Client{
 		Jar:       jar,
 		Transport: tr,
+		Timeout:   60 * time.Second,
 	}
 
 	return &SAPClient{
@@ -71,6 +82,34 @@ func NewSAPClient(baseURL, companyDB string) (*SAPClient, error) {
 	}, nil
 }
 
+// executeRequest ejecuta una petición HTTP con reintentos automáticos para errores de red o DNS transitorios.
+func (s *SAPClient) executeRequest(reqFactory func() (*http.Request, error), op string) (*http.Response, error) {
+	const maxRetries = 3
+	var lastErr error
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		req, err := reqFactory()
+		if err != nil {
+			return nil, NewSAPConnectionError(op, err)
+		}
+
+		resp, err := s.HTTPClient.Do(req)
+		if err != nil {
+			lastErr = NewSAPConnectionError(op, err)
+			// Si es un fallo de red / DNS transitorio, esperar y reintentar
+			if attempt < maxRetries {
+				time.Sleep(time.Duration(attempt*400) * time.Millisecond)
+				continue
+			}
+			return nil, lastErr
+		}
+
+		return resp, nil
+	}
+
+	return nil, lastErr
+}
+
 func (s *SAPClient) Login(user, password string) error {
 	loginData := LoginRequest{
 		CompanyDB: s.CompanyDB,
@@ -78,10 +117,18 @@ func (s *SAPClient) Login(user, password string) error {
 		Password:  password,
 	}
 
-	body, _ := json.Marshal(loginData)
-	resp, err := s.HTTPClient.Post(s.BaseURL+"/Login", "application/json", bytes.NewBuffer(body))
+	loginURL := s.BaseURL + "/Login"
+	resp, err := s.executeRequest(func() (*http.Request, error) {
+		body, _ := json.Marshal(loginData)
+		req, err := http.NewRequest(http.MethodPost, loginURL, bytes.NewBuffer(body))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		return req, nil
+	}, "login")
 	if err != nil {
-		return NewSAPConnectionError("login", err)
+		return err
 	}
 	defer resp.Body.Close()
 
@@ -131,17 +178,19 @@ func (s *SAPClient) MapDocNumsToDocEntries(endpoint string, docNums []string) ([
 		params.Set("$filter", filter)
 		queryURL := fmt.Sprintf("%s/%s?%s", s.BaseURL, endpoint, params.Encode())
 
-		req, err := http.NewRequest(http.MethodGet, queryURL, nil)
+		currentQueryURL := queryURL
+		resp, err := s.executeRequest(func() (*http.Request, error) {
+			req, err := http.NewRequest(http.MethodGet, currentQueryURL, nil)
+			if err != nil {
+				return nil, err
+			}
+			// Service Layer es sensible a estos headers; sin ellos puede devolver 406/415 en algunas versiones.
+			req.Header.Set("Accept", "application/json")
+			req.Header.Set("Content-Type", "application/json")
+			return req, nil
+		}, "consulta")
 		if err != nil {
-			return nil, NewSAPConnectionError("consulta", err)
-		}
-		// Service Layer es sensible a estos headers; sin ellos puede devolver 406/415 en algunas versiones.
-		req.Header.Set("Accept", "application/json")
-		req.Header.Set("Content-Type", "application/json")
-
-		resp, err := s.HTTPClient.Do(req)
-		if err != nil {
-			return nil, NewSAPConnectionError("consulta", err)
+			return nil, err
 		}
 
 		if resp.StatusCode != http.StatusOK {
@@ -193,19 +242,21 @@ func (s *SAPClient) GetOpenTransferRequests() ([]TransferRequest, error) {
 			return nil, NewSAPErrorFromResponseWithURL("consulta", 200, []byte("se excedió el límite de páginas al consultar (posible loop en nextLink)"), nextURL)
 		}
 
-		req, err := http.NewRequest(http.MethodGet, nextURL, nil)
+		reqURL := nextURL
+		resp, err := s.executeRequest(func() (*http.Request, error) {
+			req, err := http.NewRequest(http.MethodGet, reqURL, nil)
+			if err != nil {
+				return nil, err
+			}
+			// Service Layer puede devolver 406/415 si no se envía Accept explícito.
+			req.Header.Set("Accept", "application/json")
+			req.Header.Set("Content-Type", "application/json")
+			// Negocia el tamaño de página; SL lo responde en el header Preference-Applied.
+			req.Header.Set("Prefer", fmt.Sprintf("odata.maxpagesize=%d", maxPageSize))
+			return req, nil
+		}, "consulta")
 		if err != nil {
-			return nil, NewSAPConnectionError("consulta", err)
-		}
-		// Service Layer puede devolver 406/415 si no se envía Accept explícito.
-		req.Header.Set("Accept", "application/json")
-		req.Header.Set("Content-Type", "application/json")
-		// Negocia el tamaño de página; SL lo responde en el header Preference-Applied.
-		req.Header.Set("Prefer", fmt.Sprintf("odata.maxpagesize=%d", maxPageSize))
-
-		resp, err := s.HTTPClient.Do(req)
-		if err != nil {
-			return nil, NewSAPConnectionError("consulta", err)
+			return nil, err
 		}
 
 		if resp.StatusCode != http.StatusOK {
@@ -245,18 +296,20 @@ func resolveNextLink(baseURL, next string) string {
 }
 
 // CloseDocument cierra un documento individual haciendo POST a /endpoint(docEntry)/Close
+// con reintentos automáticos ante fallos de red o DNS transitorios.
 func (s *SAPClient) CloseDocument(endpoint string, docEntry int) error {
 	closeURL := fmt.Sprintf("%s/%s(%d)/Close", s.BaseURL, endpoint, docEntry)
-	req, err := http.NewRequest(http.MethodPost, closeURL, bytes.NewBuffer([]byte("{}")))
+	resp, err := s.executeRequest(func() (*http.Request, error) {
+		req, err := http.NewRequest(http.MethodPost, closeURL, bytes.NewBuffer([]byte("{}")))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("Content-Type", "application/json")
+		return req, nil
+	}, "cierre")
 	if err != nil {
-		return NewSAPConnectionError("cierre", err)
-	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := s.HTTPClient.Do(req)
-	if err != nil {
-		return NewSAPConnectionError("cierre", err)
+		return err
 	}
 	defer resp.Body.Close()
 
