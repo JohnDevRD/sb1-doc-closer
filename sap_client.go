@@ -95,42 +95,74 @@ func (s *SAPClient) Login(user, password string) error {
 
 // MapDocNumsToDocEntries obtiene los DocEntry correspondientes a los DocNum abiertos
 func (s *SAPClient) MapDocNumsToDocEntries(endpoint string, docNums []string) ([]int, error) {
-	filterNums := strings.Join(docNums, ",")
-	params := url.Values{}
-	params.Set("$select", "DocEntry,DocNum")
-	params.Set("$filter", fmt.Sprintf("DocNum in (%s) and DocumentStatus eq 'bost_Open'", filterNums))
-	queryURL := fmt.Sprintf("%s/%s?%s", s.BaseURL, endpoint, params.Encode())
-
-	req, err := http.NewRequest(http.MethodGet, queryURL, nil)
-	if err != nil {
-		return nil, NewSAPConnectionError("consulta", err)
-	}
-	// Service Layer es sensible a estos headers; sin ellos puede devolver 406/415 en algunas versiones.
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := s.HTTPClient.Do(req)
-	if err != nil {
-		return nil, NewSAPConnectionError("consulta", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return nil, NewSAPErrorFromResponseWithURL("consulta", resp.StatusCode, respBody, queryURL)
+	if len(docNums) == 0 {
+		return nil, nil
 	}
 
-	var mapping DocumentMapping
-	if err := json.NewDecoder(resp.Body).Decode(&mapping); err != nil {
-		return nil, NewSAPErrorFromResponseWithURL("consulta", resp.StatusCode, []byte("respuesta no es JSON válido: "+err.Error()), queryURL)
+	var validNums []string
+	for _, dn := range docNums {
+		dn = strings.TrimSpace(dn)
+		if dn != "" {
+			validNums = append(validNums, dn)
+		}
+	}
+	if len(validNums) == 0 {
+		return nil, nil
 	}
 
-	var docEntries []int
-	for _, doc := range mapping.Value {
-		docEntries = append(docEntries, doc.DocEntry)
+	var allDocEntries []int
+	const chunkSize = 30
+
+	for i := 0; i < len(validNums); i += chunkSize {
+		end := i + chunkSize
+		if end > len(validNums) {
+			end = len(validNums)
+		}
+		chunk := validNums[i:end]
+
+		var orParts []string
+		for _, dn := range chunk {
+			orParts = append(orParts, fmt.Sprintf("DocNum eq %s", dn))
+		}
+		filter := fmt.Sprintf("(%s) and DocumentStatus eq 'bost_Open'", strings.Join(orParts, " or "))
+
+		params := url.Values{}
+		params.Set("$select", "DocEntry,DocNum")
+		params.Set("$filter", filter)
+		queryURL := fmt.Sprintf("%s/%s?%s", s.BaseURL, endpoint, params.Encode())
+
+		req, err := http.NewRequest(http.MethodGet, queryURL, nil)
+		if err != nil {
+			return nil, NewSAPConnectionError("consulta", err)
+		}
+		// Service Layer es sensible a estos headers; sin ellos puede devolver 406/415 en algunas versiones.
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := s.HTTPClient.Do(req)
+		if err != nil {
+			return nil, NewSAPConnectionError("consulta", err)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			respBody, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			return nil, NewSAPErrorFromResponseWithURL("consulta", resp.StatusCode, respBody, queryURL)
+		}
+
+		var mapping DocumentMapping
+		if err := json.NewDecoder(resp.Body).Decode(&mapping); err != nil {
+			resp.Body.Close()
+			return nil, NewSAPErrorFromResponseWithURL("consulta", resp.StatusCode, []byte("respuesta no es JSON válido: "+err.Error()), queryURL)
+		}
+		resp.Body.Close()
+
+		for _, doc := range mapping.Value {
+			allDocEntries = append(allDocEntries, doc.DocEntry)
+		}
 	}
 
-	return docEntries, nil
+	return allDocEntries, nil
 }
 
 // GetOpenTransferRequests trae TODOS los documentos abiertos siguiendo el
@@ -210,6 +242,31 @@ func resolveNextLink(baseURL, next string) string {
 		return next
 	}
 	return strings.TrimRight(baseURL, "/") + "/" + strings.TrimLeft(next, "/")
+}
+
+// CloseDocument cierra un documento individual haciendo POST a /endpoint(docEntry)/Close
+func (s *SAPClient) CloseDocument(endpoint string, docEntry int) error {
+	closeURL := fmt.Sprintf("%s/%s(%d)/Close", s.BaseURL, endpoint, docEntry)
+	req, err := http.NewRequest(http.MethodPost, closeURL, bytes.NewBuffer([]byte("{}")))
+	if err != nil {
+		return NewSAPConnectionError("cierre", err)
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := s.HTTPClient.Do(req)
+	if err != nil {
+		return NewSAPConnectionError("cierre", err)
+	}
+	defer resp.Body.Close()
+
+	// Service Layer suele devolver 204 No Content en Close exitoso, o 200 OK.
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+		respBody, _ := io.ReadAll(resp.Body)
+		return NewSAPErrorFromResponseWithURL("cierre", resp.StatusCode, respBody, closeURL)
+	}
+
+	return nil
 }
 
 func (s *SAPClient) CloseDocumentsBatch(endpoint string, docEntries []int) error {

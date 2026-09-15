@@ -144,10 +144,22 @@ func processCloseDocument(client *SAPClient, endpoint, docName string) {
 		return
 	}
 
-	fmt.Printf("Se encontraron %d documentos listos para cerrar. Enviando petición masiva ($batch)...\n", len(docEntries))
-	if err := client.CloseDocumentsBatch(endpoint, docEntries); err != nil {
-		fmt.Printf("Error ejecutando el cierre masivo: %s\n", FriendlyErrorMessage(err, "No se pudo completar el cierre masivo. Intente de nuevo."))
-	} else {
-		fmt.Println("¡Proceso de cierre enviado exitosamente!")
+	fmt.Printf("Se encontraron %d documentos listos para cerrar. Iniciando cierre...\n\n", len(docEntries))
+	successCount := 0
+	failCount := 0
+	for n, docEntry := range docEntries {
+		fmt.Printf("[%d/%d] Cerrando DocEntry %d... ", n+1, len(docEntries), docEntry)
+		if err := client.CloseDocument(endpoint, docEntry); err != nil {
+			failCount++
+			fmt.Printf("ERROR: %s\n", FriendlyErrorMessage(err, "No se pudo cerrar."))
+			if d := DebugDetail(err); d != "" {
+				fmt.Println(d)
+			}
+		} else {
+			successCount++
+			fmt.Println("OK (Cerrado)")
+		}
 	}
+	fmt.Println()
+	fmt.Printf("Resumen: %d documento(s) cerrado(s) exitosamente, %d con error.\n", successCount, failCount)
 }

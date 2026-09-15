@@ -219,55 +219,43 @@ func confirmCloseTransferRequests(requests []TransferRequest, selected map[int]b
 	return ans == "S" || ans == "SI" || ans == "SÍ" || ans == "Y" || ans == "YES"
 }
 
-// closeSelectedTransferRequests resuelve DocEntry y ejecuta el $batch.
+// closeSelectedTransferRequests cierra cada documento seleccionado haciendo POST a InventoryTransferRequests(DocEntry)/Close.
 func closeSelectedTransferRequests(client *SAPClient, requests []TransferRequest, selected map[int]bool) {
 	ClearScreen()
 	idxs := sortedKeys(selected)
 
-	var docNums []string
-	for _, i := range idxs {
-		docNums = append(docNums, strconv.Itoa(requests[i].DocNum))
+	if len(idxs) == 0 {
+		fmt.Println("No hay registros seleccionados para cerrar.")
+		Pause("")
+		return
 	}
 
-	fmt.Printf("Revalidando %d documentos abiertos en SAP...\n", len(docNums))
-	docEntries, err := client.MapDocNumsToDocEntries("InventoryTransferRequests", docNums)
-	if err != nil {
-		fmt.Printf("Error obteniendo datos: %s\n", FriendlyErrorMessage(err, "No se pudieron obtener los documentos. Intente de nuevo."))
-		if d := DebugDetail(err); d != "" {
-			fmt.Println(d)
+	fmt.Printf("Iniciando cierre de %d documento(s) en SAP...\n\n", len(idxs))
+
+	successCount := 0
+	failCount := 0
+
+	for n, i := range idxs {
+		doc := requests[i]
+		fmt.Printf("[%d/%d] Cerrando DocNum %d (DocEntry %d)... ", n+1, len(idxs), doc.DocNum, doc.DocEntry)
+
+		err := client.CloseDocument("InventoryTransferRequests", doc.DocEntry)
+		if err != nil {
+			failCount++
+			fmt.Printf("ERROR: %s\n", FriendlyErrorMessage(err, "No se pudo cerrar."))
+			if d := DebugDetail(err); d != "" {
+				fmt.Println(d)
+			}
 		} else {
-			fmt.Println("(Tip: ejecute con SAP_DEBUG=1 para ver el detalle técnico del error.)")
-		}
-		Pause("")
-		return
-	}
-
-	if len(docEntries) == 0 {
-		fmt.Println("Ninguno de los documentos seleccionados sigue abierto en SAP.")
-		Pause("")
-		return
-	}
-
-	if len(docEntries) != len(docNums) {
-		fmt.Printf("[!] Solo %d de %d seleccionados siguen abiertos. Se cerrarán esos.\n", len(docEntries), len(docNums))
-		fmt.Print("¿Continuar? [S/N]: ")
-		ans := strings.ToUpper(strings.TrimSpace(ReadLine()))
-		if !(ans == "S" || ans == "SI" || ans == "SÍ" || ans == "Y" || ans == "YES") {
-			fmt.Println("Operación cancelada.")
-			Pause("")
-			return
+			successCount++
+			fmt.Println("OK (Cerrado)")
 		}
 	}
 
-	fmt.Printf("Cerrando %d documentos ($batch)...\n", len(docEntries))
-	if err := client.CloseDocumentsBatch("InventoryTransferRequests", docEntries); err != nil {
-		fmt.Printf("Error ejecutando el cierre masivo: %s\n", FriendlyErrorMessage(err, "No se pudo completar el cierre masivo. Intente de nuevo."))
-		if d := DebugDetail(err); d != "" {
-			fmt.Println(d)
-		}
-	} else {
-		fmt.Println("¡Proceso de cierre enviado exitosamente!")
-	}
+	fmt.Println()
+	fmt.Println(strings.Repeat("-", 60))
+	fmt.Printf("Resumen: %d documento(s) cerrado(s) exitosamente, %d con error.\n", successCount, failCount)
+	fmt.Println(strings.Repeat("-", 60))
 	Pause("")
 }
 

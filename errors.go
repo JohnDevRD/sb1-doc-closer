@@ -171,10 +171,13 @@ func (e *SAPError) FriendlyMessage() string {
 		if e.StatusCode == 401 || e.StatusCode == 403 {
 			return "La sesión expiró o no tiene permisos para cerrar documentos. Vuelva a iniciar sesión."
 		}
+		if e.SAPMessage != "" {
+			return e.SAPMessage
+		}
 		if e.StatusCode >= 500 {
 			return "El servidor SAP devolvió un error durante el cierre. Verifique en SAP qué documentos quedaron cerrados e intente de nuevo."
 		}
-		return "No se pudo completar el cierre masivo. Intente de nuevo."
+		return "No se pudo completar el cierre del documento. Intente de nuevo."
 	default:
 		return "Ocurrió un error de comunicación con SAP. Intente de nuevo."
 	}
